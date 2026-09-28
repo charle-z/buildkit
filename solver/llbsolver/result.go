@@ -72,7 +72,9 @@ func (rp *resultProxy) Provenance() any {
 func (rp *resultProxy) Release(ctx context.Context) (err error) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
-	for _, res := range rp.errResults {
+	errResults := rp.errResults
+	rp.errResults = nil
+	for _, res := range errResults {
 		rerr := res.Release(ctx)
 		if rerr != nil {
 			err = rerr
@@ -112,17 +114,37 @@ func (rp *resultProxy) wrapError(err error) error {
 	return err
 }
 
+func (rp *resultProxy) adoptExecErrorRefs(err error) {
+	var ee *llberrdefs.ExecError
+	if !errors.As(err, &ee) {
+		return
+	}
+
+	var refs []solver.Result
+	ee.EachRef(func(res solver.Result) error {
+		refs = append(refs, res)
+		return nil
+	})
+	rp.mu.Lock()
+	if !rp.released {
+		rp.errResults = append(rp.errResults, refs...)
+		// The proxy owns these refs now, so the ExecError finalizer must not release them.
+		ee.OwnerBorrowed = true
+		rp.mu.Unlock()
+		return
+	}
+	rp.mu.Unlock()
+
+	for _, res := range refs {
+		res.Release(context.TODO())
+	}
+	// The refs were cleaned up directly because the proxy had already been released.
+	ee.OwnerBorrowed = true
+}
+
 func (rp *resultProxy) loadResult(ctx context.Context) (solver.CachedResultWithProvenance, error) {
 	res, err := rp.b.loadResult(ctx, rp.req.Definition, rp.req.CacheImports, rp.req.SourcePolicies)
-	var ee *llberrdefs.ExecError
-	if errors.As(err, &ee) {
-		ee.EachRef(func(res solver.Result) error {
-			rp.errResults = append(rp.errResults, res)
-			return nil
-		})
-		// acquire ownership so ExecError finalizer doesn't attempt to release as well
-		ee.OwnerBorrowed = true
-	}
+	rp.adoptExecErrorRefs(err)
 	return res, err
 }
 
